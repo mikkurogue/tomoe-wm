@@ -147,7 +147,6 @@ pub fn init_winit(
                     // For now, render all layer surfaces as custom elements (on top of windows)
                     // TODO: Properly layer Background/Bottom under windows
 
-                    let layer_count = layer_map.layers().count();
                     for layer in [
                         WlrLayer::Background,
                         WlrLayer::Bottom,
@@ -155,29 +154,15 @@ pub fn init_winit(
                         WlrLayer::Overlay,
                     ] {
                         for layer_surface in layer_map.layers_on(layer) {
-                            let geo = layer_map.layer_geometry(layer_surface);
-                            tracing::debug!("Layer surface: geo={:?}, layer={:?}", geo, layer);
-                            if let Some(geo) = geo {
+                            if let Some(geo) = layer_map.layer_geometry(layer_surface) {
                                 let loc = geo.loc.to_physical_precise_round(output_scale);
                                 let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                                     layer_surface.render_elements(renderer, loc, output_scale, 1.0);
-                                tracing::debug!(
-                                    "Layer surface rendered {} elements",
-                                    elements.len()
-                                );
                                 layer_elements.extend(elements);
                             }
                         }
                     }
                     drop(layer_map);
-
-                    if layer_count > 0 {
-                        tracing::debug!(
-                            "Rendering {} layer surfaces with {} elements",
-                            layer_count,
-                            layer_elements.len()
-                        );
-                    }
 
                     let render_res =
                         render_output::<_, WaylandSurfaceRenderElement<GlesRenderer>, _, _>(

@@ -128,8 +128,8 @@ impl CompositorHandler for TomoeState {
                 .find(|l| l.wl_surface() == surface)
                 .cloned();
 
-            if let Some(_layer_surface) = layer_surface {
-                // Arrange to recalculate positions after commit
+            if let Some(layer_surface) = layer_surface {
+                // Check if this is the initial commit (before first configure)
                 let initial_configure_sent = with_states(surface, |states| {
                     states
                         .data_map
@@ -138,10 +138,13 @@ impl CompositorHandler for TomoeState {
                         .unwrap_or(true)
                 });
 
+                // Always arrange on layer surface commits to recalculate geometry
+                layer_map.arrange();
+
+                // If initial configure hasn't been sent, send it now
+                // arrange() calculates the size but doesn't send configure for initial commit
                 if !initial_configure_sent {
-                    // Arrange will send initial configure
-                    layer_map.arrange();
-                    tracing::debug!("Sent initial configure for layer surface");
+                    layer_surface.layer_surface().send_pending_configure();
                 }
 
                 break;
@@ -625,23 +628,9 @@ impl WlrLayerShellHandler for TomoeState {
             return;
         }
 
-        // Get output geometry for arranging - log the mode for debugging
-        let output_mode = output.current_mode();
-        tracing::debug!(
-            "Output mode: {:?}, scale: {:?}, transform: {:?}",
-            output_mode,
-            output.current_scale(),
-            output.current_transform()
-        );
-
-        // Arrange all layers - this calculates positions and sends configure
-        let changed = layer_map.arrange();
-        tracing::debug!("Layer map arrange changed: {}", changed);
-
-        // Log the configured size after arrange
-        if let Some(geo) = layer_map.layer_geometry(&desktop_surface) {
-            tracing::debug!("Layer surface geometry after arrange: {:?}", geo);
-        }
+        // Arrange all layers - this calculates positions
+        // Note: Initial configure is sent when the surface first commits
+        layer_map.arrange();
 
         info!("Layer surface mapped");
     }

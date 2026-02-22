@@ -216,6 +216,15 @@ impl Config {
         output.push_str("# Tomoe Window Manager Configuration\n");
         output.push_str("# ==================================\n\n");
 
+        // Root-level settings (before any section headers)
+        output.push_str("# Commands to run on startup\n");
+        output.push_str("# Example: on_start = [\"waybar\", \"mako\"]\n");
+        if self.on_start.is_empty() {
+            output.push_str("on_start = []\n\n");
+        } else {
+            output.push_str(&format!("on_start = {:?}\n\n", self.on_start));
+        }
+
         output.push_str("# General settings\n");
         output.push_str("[general]\n");
         output.push_str(&format!("# Gap between windows in pixels\n"));
@@ -232,14 +241,6 @@ impl Config {
         ));
         output.push_str("# Enable scrolling tiling (niri-style horizontal scrolling)\n");
         output.push_str(&format!("scrolling = {}\n\n", self.tiling.scrolling));
-
-        output.push_str("# Commands to run on startup\n");
-        output.push_str("# Example: on_start = [\"waybar\", \"mako\"]\n");
-        if self.on_start.is_empty() {
-            output.push_str("on_start = []\n\n");
-        } else {
-            output.push_str(&format!("on_start = {:?}\n\n", self.on_start));
-        }
 
         output.push_str("# Keybindings\n");
         output.push_str("# Format: \"Modifier+Key\" = { action = \"action_name\", ... }\n");
