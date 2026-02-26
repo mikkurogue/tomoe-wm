@@ -186,17 +186,6 @@ cargo test
 RUST_LOG=debug cargo run
 RUST_LOG=tomoe_wm=trace cargo run  # More verbose
 ```
-
-## Architecture
-
-- `src/main.rs` - Entry point and event loop
-- `src/state.rs` - Core compositor state
-- `src/handlers.rs` - Wayland protocol handlers
-- `src/winit.rs` - Winit backend and input handling
-- `src/config.rs` - Configuration system
-- `src/grabs.rs` - Pointer grab implementations
-- `src/wm/tiling.rs` - Scrolling tiling layout
-
 ## License
 
-[Add license information here]
+MIT

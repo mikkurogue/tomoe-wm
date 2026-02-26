@@ -1,3 +1,5 @@
+//! Pointer grab implementations for window move and resize operations
+
 use smithay::{
     desktop::Window,
     input::{

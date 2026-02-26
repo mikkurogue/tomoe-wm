@@ -1,8 +1,8 @@
+mod backend;
 mod config;
-mod grabs;
 mod handlers;
+mod input;
 mod state;
-mod winit;
 mod wm;
 
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = TomoeState::new(&mut event_loop, display, config);
 
     // Initialize winit backend
-    winit::init_winit(&mut event_loop, &mut state)?;
+    backend::init_winit(&mut event_loop, &mut state)?;
 
     // Set WAYLAND_DISPLAY for child processes
     std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);

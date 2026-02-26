@@ -1,173 +1,28 @@
+//! XDG shell and decoration handlers
+
 use smithay::{
-    backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
-    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
-    desktop::{layer_map_for_output, LayerSurface as DesktopLayerSurface, Window},
+    desktop::Window,
     input::{
         pointer::{Focus, GrabStartData},
-        Seat, SeatHandler, SeatState,
+        Seat,
     },
-    output::Output,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            protocol::{wl_buffer, wl_output, wl_seat, wl_surface::WlSurface},
+            protocol::{wl_output, wl_seat, wl_surface::WlSurface},
             Resource,
         },
     },
     utils::Serial,
-    wayland::{
-        buffer::BufferHandler,
-        compositor::{
-            get_parent, is_sync_subsurface, with_states, CompositorClientState, CompositorHandler,
-            CompositorState,
-        },
-        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
-        output::OutputHandler,
-        selection::{
-            data_device::{
-                set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
-                ServerDndGrabHandler,
-            },
-            SelectionHandler,
-        },
-        shell::{
-            wlr_layer::{Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState},
-            xdg::{
-                decoration::XdgDecorationHandler, PopupSurface, PositionerState, ToplevelSurface,
-                XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
-            },
-        },
-        shm::{ShmHandler, ShmState},
+    wayland::shell::xdg::{
+        decoration::XdgDecorationHandler, PopupSurface, PositionerState, ToplevelSurface,
+        XdgShellHandler, XdgShellState,
     },
 };
 use tracing::info;
 
-use crate::{
-    grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
-    state::{ClientState, TomoeState},
-};
-
-// Buffer handler
-impl BufferHandler for TomoeState {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
-}
-
-// Compositor handler
-impl CompositorHandler for TomoeState {
-    fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor_state
-    }
-
-    fn client_compositor_state<'a>(
-        &self,
-        client: &'a smithay::reexports::wayland_server::Client,
-    ) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
-    }
-
-    fn commit(&mut self, surface: &WlSurface) {
-        // Handle buffer commits - this is essential for rendering
-        on_commit_buffer_handler::<Self>(surface);
-
-        // Handle subsurfaces - find the root surface
-        if !is_sync_subsurface(surface) {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
-
-            // Find the window for this surface and call on_commit
-            if let Some(window) = self
-                .space
-                .elements()
-                .find(|w| {
-                    w.toplevel()
-                        .map(|t| t.wl_surface() == &root)
-                        .unwrap_or(false)
-                })
-                .cloned()
-            {
-                window.on_commit();
-            }
-        }
-
-        // Handle initial configure for toplevels
-        if let Some(window) = self
-            .space
-            .elements()
-            .find(|w| {
-                w.toplevel()
-                    .map(|t| t.wl_surface() == surface)
-                    .unwrap_or(false)
-            })
-            .cloned()
-        {
-            let initial_configure_sent = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .initial_configure_sent
-            });
-
-            if !initial_configure_sent {
-                window.toplevel().unwrap().send_configure();
-            }
-        }
-
-        // Handle layer surface commits
-        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
-            let mut layer_map = layer_map_for_output(&output);
-
-            // Check if this surface belongs to any layer surface
-            let layer_surface = layer_map
-                .layers()
-                .find(|l| l.wl_surface() == surface)
-                .cloned();
-
-            if let Some(layer_surface) = layer_surface {
-                // Check if this is the initial commit (before first configure)
-                let initial_configure_sent = with_states(surface, |states| {
-                    states
-                        .data_map
-                        .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
-                        .map(|data| data.lock().unwrap().initial_configure_sent)
-                        .unwrap_or(true)
-                });
-
-                // Always arrange on layer surface commits to recalculate geometry
-                layer_map.arrange();
-
-                // If initial configure hasn't been sent, send it now
-                // arrange() calculates the size but doesn't send configure for initial commit
-                if !initial_configure_sent {
-                    layer_surface.layer_surface().send_pending_configure();
-
-                    // If this layer surface requests keyboard focus, give it focus
-                    // This is important for apps like wofi that need keyboard input
-                    if layer_surface.can_receive_keyboard_focus() {
-                        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                        let keyboard = self.seat.get_keyboard().unwrap();
-                        keyboard.set_focus(self, Some(surface.clone()), serial);
-                        tracing::info!("Layer surface requested keyboard focus, granting focus");
-                    }
-                }
-
-                // Update tiling for exclusive zones
-                drop(layer_map);
-                self.update_tiling_for_layer_shells(&output);
-
-                break;
-            }
-        }
-
-        // Handle popup commits
-        self.popups.commit(surface);
-    }
-}
+use crate::input::grabs::{MoveSurfaceGrab, ResizeSurfaceGrab};
+use crate::state::TomoeState;
 
 // XDG Shell handler
 impl XdgShellHandler for TomoeState {
@@ -450,27 +305,10 @@ impl TomoeState {
             tracing::debug!("Resize grab set successfully");
         }
     }
-
-    /// Update tiling layout to respect layer shell exclusive zones
-    pub fn update_tiling_for_layer_shells(&mut self, output: &Output) {
-        let layer_map = layer_map_for_output(output);
-        let non_exclusive = layer_map.non_exclusive_zone();
-        drop(layer_map);
-
-        // Update tiling layout with the available area (after layer shells reserve their space)
-        self.tiling.set_available_area(non_exclusive);
-        self.tiling.reconfigure_all();
-
-        // Update window positions
-        let positions = self.tiling.calculate_positions();
-        for (window, pos) in positions {
-            self.space.map_element(window.clone(), pos, false);
-        }
-    }
 }
 
 /// Check if a grab should be initiated - returns start data for the grab
-fn check_grab(
+pub fn check_grab(
     seat: &Seat<TomoeState>,
     surface: &WlSurface,
     serial: Serial,
@@ -552,186 +390,3 @@ impl XdgDecorationHandler for TomoeState {
         toplevel.send_pending_configure();
     }
 }
-
-// Seat handler
-impl SeatHandler for TomoeState {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
-
-    fn seat_state(&mut self) -> &mut SeatState<Self> {
-        &mut self.seat_state
-    }
-
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        let dh = &self.display_handle;
-        let focus = focused.and_then(|s| dh.get_client(s.id()).ok());
-        set_data_device_focus(dh, seat, focus);
-    }
-
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
-    }
-}
-
-// Selection handler (required for DataDeviceHandler)
-impl SelectionHandler for TomoeState {
-    type SelectionUserData = ();
-}
-
-// Data device handler
-impl DataDeviceHandler for TomoeState {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
-    }
-}
-
-impl ClientDndGrabHandler for TomoeState {}
-impl ServerDndGrabHandler for TomoeState {}
-
-// SHM handler
-impl ShmHandler for TomoeState {
-    fn shm_state(&self) -> &ShmState {
-        &self.shm_state
-    }
-}
-
-// DMA-BUF handler
-impl DmabufHandler for TomoeState {
-    fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.dmabuf_state
-    }
-
-    fn dmabuf_imported(
-        &mut self,
-        _global: &DmabufGlobal,
-        dmabuf: Dmabuf,
-        notifier: ImportNotifier,
-    ) {
-        // For now, accept all dmabufs - in a real compositor you'd validate with the renderer
-        self.dmabuf_imported = Some(dmabuf);
-        let _ = notifier.successful::<TomoeState>();
-    }
-}
-
-// Output handler
-impl OutputHandler for TomoeState {}
-
-// Layer shell handler
-impl WlrLayerShellHandler for TomoeState {
-    fn shell_state(&mut self) -> &mut WlrLayerShellState {
-        &mut self.layer_shell_state
-    }
-
-    fn new_layer_surface(
-        &mut self,
-        surface: LayerSurface,
-        output: Option<wl_output::WlOutput>,
-        layer: Layer,
-        namespace: String,
-    ) {
-        info!(
-            "New layer surface: namespace={}, layer={:?}",
-            namespace, layer
-        );
-
-        // Get the output for this layer surface
-        let output = output
-            .as_ref()
-            .and_then(Output::from_resource)
-            .or_else(|| self.space.outputs().next().cloned());
-
-        let Some(output) = output else {
-            tracing::warn!("No output available for layer surface");
-            return;
-        };
-
-        // Wrap in desktop LayerSurface
-        let desktop_surface = DesktopLayerSurface::new(surface, namespace.clone());
-
-        // Get the layer map for this output and insert the surface
-        let mut layer_map = layer_map_for_output(&output);
-
-        // Map the layer surface
-        if let Err(e) = layer_map.map_layer(&desktop_surface) {
-            tracing::error!("Failed to map layer surface: {:?}", e);
-            return;
-        }
-
-        // Arrange all layers - this calculates positions and handles exclusive zones
-        layer_map.arrange();
-
-        // Get the non-exclusive zone (area available for windows after layer shells reserve space)
-        let non_exclusive = layer_map.non_exclusive_zone();
-        drop(layer_map);
-
-        // Update tiling layout to respect layer shell exclusive zones
-        self.update_tiling_for_layer_shells(&output);
-
-        info!(
-            "Layer surface mapped, non-exclusive zone: {:?}",
-            non_exclusive
-        );
-    }
-
-    fn layer_destroyed(&mut self, surface: LayerSurface) {
-        info!("Layer surface destroyed");
-
-        // Find the output this layer surface was on and remove it
-        let mut found_output = None;
-        let mut had_keyboard_focus = false;
-
-        for output in self.space.outputs() {
-            let mut layer_map = layer_map_for_output(output);
-            // We need to find the desktop layer surface that wraps this wlr surface
-            let desktop_surface = layer_map
-                .layers()
-                .find(|l| l.layer_surface() == &surface)
-                .cloned();
-
-            if let Some(desktop_surface) = desktop_surface {
-                // Check if this layer surface had keyboard focus capability
-                had_keyboard_focus = desktop_surface.can_receive_keyboard_focus();
-                layer_map.unmap_layer(&desktop_surface);
-                found_output = Some(output.clone());
-                break;
-            }
-        }
-
-        // Update tiling layout after layer surface is removed
-        if let Some(output) = found_output {
-            self.update_tiling_for_layer_shells(&output);
-        }
-
-        // If the destroyed layer surface could receive keyboard focus,
-        // restore focus to the tiled focused window
-        if had_keyboard_focus {
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            let keyboard = self.seat.get_keyboard().unwrap();
-            if let Some(focused) = self.tiling.focused_window() {
-                if let Some(toplevel) = focused.toplevel() {
-                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
-                    tracing::info!(
-                        "Restored keyboard focus to tiled window after layer surface destroyed"
-                    );
-                }
-            } else {
-                keyboard.set_focus(self, None, serial);
-            }
-        }
-    }
-}
-
-// Delegate macros
-delegate_compositor!(TomoeState);
-delegate_xdg_shell!(TomoeState);
-delegate_xdg_decoration!(TomoeState);
-delegate_shm!(TomoeState);
-delegate_seat!(TomoeState);
-delegate_data_device!(TomoeState);
-delegate_output!(TomoeState);
-delegate_dmabuf!(TomoeState);
-delegate_layer_shell!(TomoeState);
