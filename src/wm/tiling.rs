@@ -5,7 +5,7 @@
 
 use smithay::{
     desktop::Window,
-    utils::{Logical, Point, Size},
+    utils::{Logical, Point, Rectangle, Size},
 };
 
 /// Manages the scrolling tiling layout
@@ -19,12 +19,15 @@ pub struct TilingLayout {
     scroll_offset: i32,
     /// Gap between windows
     gap: i32,
-    /// Outer margin
+    /// Outer margin (additional margin within the available area)
     margin: i32,
-    /// Default window width as percentage of output width
+    /// Default window width as percentage of available width
     default_width_percent: f64,
-    /// Output size
+    /// Full output size
     output_size: Size<i32, Logical>,
+    /// Available area for tiling (after layer shells reserve their space)
+    /// This is the non-exclusive zone from layer shells
+    available_area: Option<Rectangle<i32, Logical>>,
 }
 
 impl TilingLayout {
@@ -37,19 +40,38 @@ impl TilingLayout {
             margin,
             default_width_percent,
             output_size: Size::from((1920, 1080)), // Default, updated when output is known
+            available_area: None,
         }
     }
 
     /// Set the output size for layout calculations
     pub fn set_output_size(&mut self, size: Size<i32, Logical>) {
         self.output_size = size;
+        // Reset available area when output size changes - it will be updated by layer shell handler
+        self.available_area = None;
+    }
+
+    /// Set the available area for tiling (respecting layer shell exclusive zones)
+    pub fn set_available_area(&mut self, area: Rectangle<i32, Logical>) {
+        tracing::debug!(
+            "Setting available area: {:?} (output: {:?})",
+            area,
+            self.output_size
+        );
+        self.available_area = Some(area);
+    }
+
+    /// Get the effective tiling area (available_area if set, otherwise full output minus margins)
+    fn get_tiling_area(&self) -> Rectangle<i32, Logical> {
+        self.available_area
+            .unwrap_or_else(|| Rectangle::new((0, 0).into(), self.output_size))
     }
 
     /// Add a new window to the layout (appends to the right)
     pub fn add_window(&mut self, window: Window) {
         // Configure the window size
         let window_width = self.calculate_window_width();
-        let window_height = self.output_size.h - 2 * self.margin;
+        let window_height = self.calculate_window_height();
 
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|state| {
@@ -149,11 +171,14 @@ impl TilingLayout {
     /// Returns (window, position) pairs
     pub fn calculate_positions(&self) -> Vec<(&Window, Point<i32, Logical>)> {
         let mut positions = Vec::new();
+        let area = self.get_tiling_area();
         let window_width = self.calculate_window_width();
-        let mut x = self.margin - self.scroll_offset;
+
+        // Start position: area origin + margin - scroll offset
+        let mut x = area.loc.x + self.margin - self.scroll_offset;
+        let y = area.loc.y + self.margin;
 
         for window in &self.windows {
-            let y = self.margin;
             positions.push((window, Point::from((x, y))));
             x += window_width + self.gap;
         }
@@ -178,8 +203,15 @@ impl TilingLayout {
 
     /// Calculate the default window width
     fn calculate_window_width(&self) -> i32 {
-        let available_width = self.output_size.w - 2 * self.margin;
+        let area = self.get_tiling_area();
+        let available_width = area.size.w - 2 * self.margin;
         (available_width as f64 * self.default_width_percent) as i32
+    }
+
+    /// Calculate the window height
+    fn calculate_window_height(&self) -> i32 {
+        let area = self.get_tiling_area();
+        area.size.h - 2 * self.margin
     }
 
     /// Calculate the maximum scroll offset
@@ -188,10 +220,11 @@ impl TilingLayout {
             return 0;
         }
 
+        let area = self.get_tiling_area();
         let window_width = self.calculate_window_width();
         let total_width =
             self.windows.len() as i32 * window_width + (self.windows.len() as i32 - 1) * self.gap;
-        let visible_width = self.output_size.w - 2 * self.margin;
+        let visible_width = area.size.w - 2 * self.margin;
 
         (total_width - visible_width).max(0)
     }
@@ -202,8 +235,9 @@ impl TilingLayout {
             return;
         };
 
+        let area = self.get_tiling_area();
         let window_width = self.calculate_window_width();
-        let visible_width = self.output_size.w - 2 * self.margin;
+        let visible_width = area.size.w - 2 * self.margin;
 
         // Calculate the focused window's position (without scroll)
         let window_start = focus_idx as i32 * (window_width + self.gap);
@@ -225,7 +259,7 @@ impl TilingLayout {
     /// Reconfigure all windows with current layout settings
     pub fn reconfigure_all(&mut self) {
         let window_width = self.calculate_window_width();
-        let window_height = self.output_size.h - 2 * self.margin;
+        let window_height = self.calculate_window_height();
 
         for window in &self.windows {
             if let Some(toplevel) = window.toplevel() {

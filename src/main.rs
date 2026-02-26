@@ -2,8 +2,8 @@ mod config;
 mod grabs;
 mod handlers;
 mod state;
-mod tiling;
 mod winit;
+mod wm;
 
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
 use tracing::info;

@@ -145,7 +145,20 @@ impl CompositorHandler for TomoeState {
                 // arrange() calculates the size but doesn't send configure for initial commit
                 if !initial_configure_sent {
                     layer_surface.layer_surface().send_pending_configure();
+
+                    // If this layer surface requests keyboard focus, give it focus
+                    // This is important for apps like wofi that need keyboard input
+                    if layer_surface.can_receive_keyboard_focus() {
+                        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                        let keyboard = self.seat.get_keyboard().unwrap();
+                        keyboard.set_focus(self, Some(surface.clone()), serial);
+                        tracing::info!("Layer surface requested keyboard focus, granting focus");
+                    }
                 }
+
+                // Update tiling for exclusive zones
+                drop(layer_map);
+                self.update_tiling_for_layer_shells(&output);
 
                 break;
             }
@@ -437,6 +450,23 @@ impl TomoeState {
             tracing::debug!("Resize grab set successfully");
         }
     }
+
+    /// Update tiling layout to respect layer shell exclusive zones
+    pub fn update_tiling_for_layer_shells(&mut self, output: &Output) {
+        let layer_map = layer_map_for_output(output);
+        let non_exclusive = layer_map.non_exclusive_zone();
+        drop(layer_map);
+
+        // Update tiling layout with the available area (after layer shells reserve their space)
+        self.tiling.set_available_area(non_exclusive);
+        self.tiling.reconfigure_all();
+
+        // Update window positions
+        let positions = self.tiling.calculate_positions();
+        for (window, pos) in positions {
+            self.space.map_element(window.clone(), pos, false);
+        }
+    }
 }
 
 /// Check if a grab should be initiated - returns start data for the grab
@@ -600,10 +630,13 @@ impl WlrLayerShellHandler for TomoeState {
         &mut self,
         surface: LayerSurface,
         output: Option<wl_output::WlOutput>,
-        _layer: Layer,
+        layer: Layer,
         namespace: String,
     ) {
-        info!("New layer surface: namespace={}", namespace);
+        info!(
+            "New layer surface: namespace={}, layer={:?}",
+            namespace, layer
+        );
 
         // Get the output for this layer surface
         let output = output
@@ -617,7 +650,7 @@ impl WlrLayerShellHandler for TomoeState {
         };
 
         // Wrap in desktop LayerSurface
-        let desktop_surface = DesktopLayerSurface::new(surface, namespace);
+        let desktop_surface = DesktopLayerSurface::new(surface, namespace.clone());
 
         // Get the layer map for this output and insert the surface
         let mut layer_map = layer_map_for_output(&output);
@@ -628,17 +661,29 @@ impl WlrLayerShellHandler for TomoeState {
             return;
         }
 
-        // Arrange all layers - this calculates positions
-        // Note: Initial configure is sent when the surface first commits
+        // Arrange all layers - this calculates positions and handles exclusive zones
         layer_map.arrange();
 
-        info!("Layer surface mapped");
+        // Get the non-exclusive zone (area available for windows after layer shells reserve space)
+        let non_exclusive = layer_map.non_exclusive_zone();
+        drop(layer_map);
+
+        // Update tiling layout to respect layer shell exclusive zones
+        self.update_tiling_for_layer_shells(&output);
+
+        info!(
+            "Layer surface mapped, non-exclusive zone: {:?}",
+            non_exclusive
+        );
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         info!("Layer surface destroyed");
 
         // Find the output this layer surface was on and remove it
+        let mut found_output = None;
+        let mut had_keyboard_focus = false;
+
         for output in self.space.outputs() {
             let mut layer_map = layer_map_for_output(output);
             // We need to find the desktop layer surface that wraps this wlr surface
@@ -648,8 +693,33 @@ impl WlrLayerShellHandler for TomoeState {
                 .cloned();
 
             if let Some(desktop_surface) = desktop_surface {
+                // Check if this layer surface had keyboard focus capability
+                had_keyboard_focus = desktop_surface.can_receive_keyboard_focus();
                 layer_map.unmap_layer(&desktop_surface);
+                found_output = Some(output.clone());
                 break;
+            }
+        }
+
+        // Update tiling layout after layer surface is removed
+        if let Some(output) = found_output {
+            self.update_tiling_for_layer_shells(&output);
+        }
+
+        // If the destroyed layer surface could receive keyboard focus,
+        // restore focus to the tiled focused window
+        if had_keyboard_focus {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let keyboard = self.seat.get_keyboard().unwrap();
+            if let Some(focused) = self.tiling.focused_window() {
+                if let Some(toplevel) = focused.toplevel() {
+                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
+                    tracing::info!(
+                        "Restored keyboard focus to tiled window after layer surface destroyed"
+                    );
+                }
+            } else {
+                keyboard.set_focus(self, None, serial);
             }
         }
     }

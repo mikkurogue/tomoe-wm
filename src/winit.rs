@@ -301,8 +301,6 @@ fn handle_input(
             }
         }
         InputEvent::PointerMotionAbsolute { event } => {
-            use smithay::desktop::WindowSurfaceType;
-
             let output = state.space.outputs().next().unwrap().clone();
             let output_geo = state.space.output_geometry(&output).unwrap();
             let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
@@ -310,15 +308,10 @@ fn handle_input(
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             let pointer = state.seat.get_pointer().unwrap();
 
-            let under = state.space.element_under(pos).and_then(|(w, window_loc)| {
-                let pos_in_window = pos - window_loc.to_f64();
-                w.surface_under(pos_in_window, WindowSurfaceType::ALL).map(
-                    |(surface, surface_offset)| {
-                        let surface_loc = window_loc + surface_offset;
-                        (surface, surface_loc.to_f64())
-                    },
-                )
-            });
+            // First check layer surfaces (they're on top)
+            let under = state
+                .surface_under(pos)
+                .map(|(surface, loc)| (surface, loc.to_f64()));
 
             pointer.motion(
                 state,
@@ -332,31 +325,19 @@ fn handle_input(
             pointer.frame(state);
         }
         InputEvent::PointerButton { event } => {
-            use smithay::desktop::WindowSurfaceType;
-
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             let pointer = state.seat.get_pointer().unwrap();
             let keyboard = state.seat.get_keyboard().unwrap();
 
-            // On button press, set keyboard focus to the window under the pointer
+            // On button press, set keyboard focus to the surface under the pointer
             if event.state() == ButtonState::Pressed {
                 let pos = pointer.current_location();
 
-                let window_info = state.space.element_under(pos).map(|(w, window_loc)| {
-                    let pos_in_window = pos - window_loc.to_f64();
-                    let focus_surface = w
-                        .surface_under(pos_in_window, WindowSurfaceType::TOPLEVEL)
-                        .map(|(s, _)| s);
-                    (w.clone(), focus_surface)
-                });
-
-                if let Some((window, focus_surface)) = window_info {
-                    // Raise window and focus it in tiling
-                    state.space.raise_element(&window, true);
-                    state.tiling.focus_window(&window);
-
-                    if let Some(surface) = focus_surface {
-                        keyboard.set_focus(state, Some(surface), serial);
+                // Check what's under the pointer (layer surfaces first, then windows)
+                if let Some((_surface, keyboard_focus)) = state.focus_target_under(pos) {
+                    // Set keyboard focus if the surface can receive it
+                    if let Some(focus_surface) = keyboard_focus {
+                        keyboard.set_focus(state, Some(focus_surface), serial);
                     }
                 } else {
                     keyboard.set_focus(state, None, serial);

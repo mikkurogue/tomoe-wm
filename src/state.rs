@@ -1,21 +1,23 @@
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
-    desktop::{PopupManager, Space, Window},
+    desktop::{layer_map_for_output, PopupManager, Space, Window, WindowSurfaceType},
     input::{keyboard::XkbConfig, Seat, SeatState},
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
+            protocol::wl_surface::WlSurface,
             Display, DisplayHandle,
         },
     },
+    utils::{Logical, Point},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::{
-            wlr_layer::WlrLayerShellState,
+            wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
             xdg::{decoration::XdgDecorationState, XdgShellState},
         },
         shm::ShmState,
@@ -25,7 +27,7 @@ use smithay::{
 use std::{ffi::OsString, sync::Arc, time::Instant};
 
 use crate::config::Config;
-use crate::tiling::TilingLayout;
+use crate::wm::tiling::TilingLayout;
 
 pub struct TomoeState {
     pub display_handle: DisplayHandle,
@@ -183,6 +185,142 @@ impl TomoeState {
                 tracing::warn!("Failed to run startup command '{}': {}", cmd, e);
             }
         }
+    }
+
+    /// Find the surface under a position, checking layer surfaces first (top to bottom),
+    /// then windows. Returns the surface and its location.
+    pub fn surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<i32, Logical>)> {
+        let output = self.space.outputs().next()?;
+        let layer_map = layer_map_for_output(output);
+
+        // Check layer surfaces from top to bottom (Overlay, Top, Bottom, Background)
+        // But for pointer interaction, we only care about Overlay and Top (above windows)
+        for layer in [WlrLayer::Overlay, WlrLayer::Top] {
+            for layer_surface in layer_map.layers_on(layer) {
+                if let Some(geo) = layer_map.layer_geometry(layer_surface) {
+                    let surface_loc = geo.loc;
+                    let pos_in_surface = pos - surface_loc.to_f64();
+
+                    if let Some((surface, offset)) =
+                        layer_surface.surface_under(pos_in_surface, WindowSurfaceType::ALL)
+                    {
+                        return Some((surface, surface_loc + offset));
+                    }
+                }
+            }
+        }
+
+        // No need to hold the layer_map anymore
+        drop(layer_map);
+
+        // Check windows in the space
+        if let Some((window, window_loc)) = self.space.element_under(pos) {
+            let pos_in_window = pos - window_loc.to_f64();
+            if let Some((surface, offset)) =
+                window.surface_under(pos_in_window, WindowSurfaceType::ALL)
+            {
+                return Some((surface, window_loc + offset));
+            }
+        }
+
+        // Check bottom layer surfaces (below windows)
+        let layer_map = layer_map_for_output(output);
+        for layer in [WlrLayer::Bottom, WlrLayer::Background] {
+            for layer_surface in layer_map.layers_on(layer) {
+                if let Some(geo) = layer_map.layer_geometry(layer_surface) {
+                    let surface_loc = geo.loc;
+                    let pos_in_surface = pos - surface_loc.to_f64();
+
+                    if let Some((surface, offset)) =
+                        layer_surface.surface_under(pos_in_surface, WindowSurfaceType::ALL)
+                    {
+                        return Some((surface, surface_loc + offset));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Find the focus target under a position.
+    /// Returns:
+    /// - The surface for pointer focus
+    /// - An optional surface for keyboard focus (only if the target can receive keyboard focus)
+    pub fn focus_target_under(
+        &mut self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Option<WlSurface>)> {
+        let output = self.space.outputs().next()?.clone();
+        let layer_map = layer_map_for_output(&output);
+
+        // Check layer surfaces from top to bottom (Overlay, Top)
+        for layer in [WlrLayer::Overlay, WlrLayer::Top] {
+            for layer_surface in layer_map.layers_on(layer) {
+                if let Some(geo) = layer_map.layer_geometry(layer_surface) {
+                    let surface_loc = geo.loc;
+                    let pos_in_surface = pos - surface_loc.to_f64();
+
+                    if let Some((surface, _offset)) =
+                        layer_surface.surface_under(pos_in_surface, WindowSurfaceType::ALL)
+                    {
+                        // Check if this layer surface can receive keyboard focus
+                        let keyboard_focus = if layer_surface.can_receive_keyboard_focus() {
+                            Some(layer_surface.wl_surface().clone())
+                        } else {
+                            None
+                        };
+                        return Some((surface, keyboard_focus));
+                    }
+                }
+            }
+        }
+
+        drop(layer_map);
+
+        // Check windows in the space
+        if let Some((window, window_loc)) = self.space.element_under(pos) {
+            let pos_in_window = pos - window_loc.to_f64();
+            if let Some((surface, _offset)) =
+                window.surface_under(pos_in_window, WindowSurfaceType::ALL)
+            {
+                // Raise window and focus it in tiling
+                let window = window.clone();
+                self.space.raise_element(&window, true);
+                self.tiling.focus_window(&window);
+
+                // Windows can always receive keyboard focus
+                let keyboard_focus = window.toplevel().map(|t| t.wl_surface().clone());
+                return Some((surface, keyboard_focus));
+            }
+        }
+
+        // Check bottom layer surfaces (Bottom, Background)
+        let layer_map = layer_map_for_output(&output);
+        for layer in [WlrLayer::Bottom, WlrLayer::Background] {
+            for layer_surface in layer_map.layers_on(layer) {
+                if let Some(geo) = layer_map.layer_geometry(layer_surface) {
+                    let surface_loc = geo.loc;
+                    let pos_in_surface = pos - surface_loc.to_f64();
+
+                    if let Some((surface, _offset)) =
+                        layer_surface.surface_under(pos_in_surface, WindowSurfaceType::ALL)
+                    {
+                        let keyboard_focus = if layer_surface.can_receive_keyboard_focus() {
+                            Some(layer_surface.wl_surface().clone())
+                        } else {
+                            None
+                        };
+                        return Some((surface, keyboard_focus));
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Spawn a command with the correct WAYLAND_DISPLAY set
