@@ -1,5 +1,6 @@
 mod backend;
 mod config;
+mod cursor;
 mod handlers;
 mod input;
 mod state;

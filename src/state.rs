@@ -28,6 +28,7 @@ use std::{ffi::OsString, sync::Arc, time::Instant};
 
 use crate::backend::udev::UdevData;
 use crate::config::Config;
+use crate::cursor::CursorManager;
 use crate::wm::tiling::TilingLayout;
 use crate::wm::Layout;
 
@@ -66,6 +67,9 @@ pub struct TomoeState {
 
     // Backend-specific data
     pub udev_data: Option<UdevData>,
+
+    // Cursor management (for DRM backend software cursor)
+    pub cursor_manager: CursorManager,
 }
 
 impl TomoeState {
@@ -151,6 +155,7 @@ impl TomoeState {
             seat,
             dmabuf_imported: None,
             udev_data: None,
+            cursor_manager: CursorManager::new(),
         }
     }
 

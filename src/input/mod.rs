@@ -226,18 +226,25 @@ fn handle_pointer_motion_relative<B: InputBackend, E: PointerMotionEvent<B>>(
     new_pos.x += event.delta_x();
     new_pos.y += event.delta_y();
 
-    // Clamp to output bounds
-    if let Some(output) = state.space.outputs().next() {
-        if let Some(output_geo) = state.space.output_geometry(output) {
-            new_pos.x = new_pos
-                .x
-                .max(0.0)
-                .min((output_geo.loc.x + output_geo.size.w) as f64);
-            new_pos.y = new_pos
-                .y
-                .max(0.0)
-                .min((output_geo.loc.y + output_geo.size.h) as f64);
+    // Clamp to combined output bounds (union of all outputs)
+    let mut min_x = 0i32;
+    let mut min_y = 0i32;
+    let mut max_x = 0i32;
+    let mut max_y = 0i32;
+
+    for output in state.space.outputs() {
+        if let Some(geo) = state.space.output_geometry(output) {
+            min_x = min_x.min(geo.loc.x);
+            min_y = min_y.min(geo.loc.y);
+            max_x = max_x.max(geo.loc.x + geo.size.w);
+            max_y = max_y.max(geo.loc.y + geo.size.h);
         }
+    }
+
+    // Only clamp if we have outputs
+    if max_x > min_x && max_y > min_y {
+        new_pos.x = new_pos.x.max(min_x as f64).min(max_x as f64 - 1.0);
+        new_pos.y = new_pos.y.max(min_y as f64).min(max_y as f64 - 1.0);
     }
 
     let under = state

@@ -20,10 +20,11 @@ use smithay::{
         renderer::{
             damage::OutputDamageTracker,
             element::{
-                surface::WaylandSurfaceRenderElement, AsRenderElements, RenderElement,
-                RenderElementStates,
+                memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement,
+                AsRenderElements, Element, Id, Kind, RenderElement,
             },
-            gles::GlesRenderer,
+            gles::{GlesError, GlesFrame, GlesRenderer},
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
             ImportDma, Renderer,
         },
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
@@ -32,12 +33,15 @@ use smithay::{
     desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties},
     reexports::{
-        calloop::{EventLoop, RegistrationToken},
+        calloop::{
+            timer::{TimeoutAction, Timer},
+            EventLoop, RegistrationToken,
+        },
         drm::control::{connector, crtc, ModeTypeFlags},
         input::Libinput,
         rustix::fs::OFlags,
     },
-    utils::{DeviceFd, Point, Scale, Size, Transform},
+    utils::{Buffer, DeviceFd, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner, SimpleCrtcMapper};
@@ -50,6 +54,115 @@ use crate::state::TomoeState;
 /// Supported color formats for DRM
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Xrgb8888];
 
+/// Combined render element for the DRM backend
+/// Supports both Wayland surfaces and memory buffers (for cursor)
+#[derive(Debug)]
+pub enum OutputRenderElement {
+    Wayland(WaylandSurfaceRenderElement<GlesRenderer>),
+    Cursor(MemoryRenderBufferRenderElement<GlesRenderer>),
+}
+
+impl Element for OutputRenderElement {
+    fn id(&self) -> &Id {
+        match self {
+            OutputRenderElement::Wayland(e) => e.id(),
+            OutputRenderElement::Cursor(e) => e.id(),
+        }
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        match self {
+            OutputRenderElement::Wayland(e) => e.current_commit(),
+            OutputRenderElement::Cursor(e) => e.current_commit(),
+        }
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        match self {
+            OutputRenderElement::Wayland(e) => e.geometry(scale),
+            OutputRenderElement::Cursor(e) => e.geometry(scale),
+        }
+    }
+
+    fn transform(&self) -> Transform {
+        match self {
+            OutputRenderElement::Wayland(e) => e.transform(),
+            OutputRenderElement::Cursor(e) => e.transform(),
+        }
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        match self {
+            OutputRenderElement::Wayland(e) => e.src(),
+            OutputRenderElement::Cursor(e) => e.src(),
+        }
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        match self {
+            OutputRenderElement::Wayland(e) => e.damage_since(scale, commit),
+            OutputRenderElement::Cursor(e) => e.damage_since(scale, commit),
+        }
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        match self {
+            OutputRenderElement::Wayland(e) => e.opaque_regions(scale),
+            OutputRenderElement::Cursor(e) => e.opaque_regions(scale),
+        }
+    }
+
+    fn alpha(&self) -> f32 {
+        match self {
+            OutputRenderElement::Wayland(e) => e.alpha(),
+            OutputRenderElement::Cursor(e) => e.alpha(),
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        match self {
+            OutputRenderElement::Wayland(e) => e.kind(),
+            OutputRenderElement::Cursor(e) => e.kind(),
+        }
+    }
+}
+
+impl RenderElement<GlesRenderer> for OutputRenderElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        match self {
+            OutputRenderElement::Wayland(e) => {
+                RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions)
+            }
+            OutputRenderElement::Cursor(e) => {
+                RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions)
+            }
+        }
+    }
+}
+
+impl From<WaylandSurfaceRenderElement<GlesRenderer>> for OutputRenderElement {
+    fn from(e: WaylandSurfaceRenderElement<GlesRenderer>) -> Self {
+        OutputRenderElement::Wayland(e)
+    }
+}
+
+impl From<MemoryRenderBufferRenderElement<GlesRenderer>> for OutputRenderElement {
+    fn from(e: MemoryRenderBufferRenderElement<GlesRenderer>) -> Self {
+        OutputRenderElement::Cursor(e)
+    }
+}
+
 /// State for the udev backend - this must persist for the lifetime of the compositor
 pub struct UdevData {
     pub session: LibSeatSession,
@@ -57,6 +170,8 @@ pub struct UdevData {
     pub devices: HashMap<DrmNode, OutputDevice>,
     /// Whether the session is currently active (not switched to another VT)
     pub session_active: bool,
+    /// Whether we've successfully displayed at least one frame (for startup safety)
+    pub startup_complete: bool,
 }
 
 /// Data associated with a DRM device (GPU)
@@ -70,6 +185,17 @@ pub struct OutputDevice {
     pub registration_token: RegistrationToken,
 }
 
+/// State machine for tracking frame rendering
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedrawState {
+    /// Idle - no frame pending, can render a new frame
+    Idle,
+    /// A redraw was requested but we're waiting for VBlank
+    Queued,
+    /// A frame has been submitted and we're waiting for VBlank
+    WaitingForVBlank,
+}
+
 /// Surface for rendering to a specific output (monitor)
 pub struct Surface {
     pub output: Output,
@@ -77,6 +203,10 @@ pub struct Surface {
     pub connector: connector::Handle,
     pub compositor: GbmDrmCompositor,
     pub damage_tracker: OutputDamageTracker,
+    /// Whether we need to force submit a frame (first frame or after VT switch)
+    pub needs_initial_frame: bool,
+    /// Redraw state machine to prevent GPU command queue overflow
+    pub redraw_state: RedrawState,
 }
 
 /// Type alias for the DRM compositor we use
@@ -110,6 +240,7 @@ pub fn init_udev(
         primary_gpu,
         devices: HashMap::new(),
         session_active: true,
+        startup_complete: false,
     };
     state.udev_data = Some(udev_data);
 
@@ -152,6 +283,23 @@ pub fn init_udev(
         .handle()
         .insert_source(libinput_backend, |event, _, state| {
             crate::input::handle_libinput_event(state, event);
+        })?;
+
+    // Add a startup safety timer - if we don't get a successful frame within 5 seconds,
+    // something is wrong and we should exit gracefully to return control to the TTY
+    let startup_timer = Timer::from_duration(Duration::from_secs(5));
+    event_loop
+        .handle()
+        .insert_source(startup_timer, |_, _, state| {
+            if let Some(udev_data) = &state.udev_data {
+                if !udev_data.startup_complete {
+                    error!("FATAL: Startup timeout - no successful frame within 5 seconds");
+                    error!("This usually means the DRM backend failed to initialize properly.");
+                    error!("Exiting to return control to the TTY...");
+                    state.running = false;
+                }
+            }
+            TimeoutAction::Drop // Only run once
         })?;
 
     info!("Udev backend initialized successfully");
@@ -384,6 +532,8 @@ fn connector_connected(
         connector: connector.handle(),
         compositor,
         damage_tracker,
+        needs_initial_frame: true, // First frame must always be submitted
+        redraw_state: RedrawState::Idle, // Start idle, will be set to WaitingForVBlank after initial frame
     };
 
     device.surfaces.insert(crtc, surface);
@@ -393,8 +543,8 @@ fn connector_connected(
         connector_name, position.x, position.y
     );
 
-    // Queue initial render
-    queue_redraw(state, device.node, crtc);
+    // Render and queue initial frame directly (device isn't in HashMap yet, so we can't use queue_redraw)
+    render_initial_frame(state, device, crtc)?;
 
     Ok(())
 }
@@ -503,6 +653,8 @@ fn handle_session_event(state: &mut TomoeState, event: SessionEvent) {
                     if let Err(e) = surface.compositor.reset_state() {
                         warn!("Failed to reset compositor state: {}", e);
                     }
+                    // Force initial frame after VT switch
+                    surface.needs_initial_frame = true;
                 }
             }
 
@@ -563,77 +715,245 @@ fn on_vblank(
     crtc: crtc::Handle,
     _metadata: Option<DrmEventMetadata>,
 ) {
-    let Some(udev_data) = state.udev_data.as_mut() else {
-        return;
+    let needs_redraw = {
+        let Some(udev_data) = state.udev_data.as_mut() else {
+            return;
+        };
+
+        if !udev_data.session_active {
+            return;
+        }
+
+        // Mark startup as complete - we got a VBlank, meaning the display is working!
+        if !udev_data.startup_complete {
+            info!("First VBlank received - display is working, startup complete");
+            udev_data.startup_complete = true;
+        }
+
+        let Some(device) = udev_data.devices.get_mut(&node) else {
+            error!("Missing device in VBlank callback for CRTC {:?}", crtc);
+            return;
+        };
+
+        let Some(surface) = device.surfaces.get_mut(&crtc) else {
+            error!("Missing surface in VBlank callback for CRTC {:?}", crtc);
+            return;
+        };
+
+        // Mark the last frame as submitted
+        match surface.compositor.frame_submitted() {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Error in frame_submitted: {}", e);
+            }
+        }
+
+        // Update redraw state - check if we had a redraw queued while waiting
+        match surface.redraw_state {
+            RedrawState::WaitingForVBlank => {
+                // Normal case - frame was displayed, go back to queued for next frame
+                // For DRM we keep rendering to maintain VBlank loop
+                surface.redraw_state = RedrawState::Queued;
+                true
+            }
+            RedrawState::Queued => {
+                // A redraw was queued while waiting - render now
+                true
+            }
+            RedrawState::Idle => {
+                // Shouldn't happen in VBlank callback but handle gracefully
+                warn!("Unexpected Idle state in VBlank callback");
+                surface.redraw_state = RedrawState::Queued;
+                true
+            }
+        }
     };
 
-    if !udev_data.session_active {
-        return;
+    // Render the next frame if needed (outside the borrow scope)
+    if needs_redraw {
+        render_surface(state, node, crtc);
+    }
+}
+
+/// Render the initial frame for a newly connected output
+/// This is called from connector_connected() before the device is in the HashMap
+fn render_initial_frame(
+    state: &mut TomoeState,
+    device: &mut OutputDevice,
+    crtc: crtc::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let surface = device
+        .surfaces
+        .get_mut(&crtc)
+        .ok_or("Surface not found for initial frame")?;
+
+    let output = surface.output.clone();
+    let output_scale = Scale::from(output.current_scale().fractional_scale());
+
+    info!(
+        "render_initial_frame: rendering first frame for output {}",
+        output.name()
+    );
+
+    // For the initial frame, render the cursor at a default position (center of screen)
+    let mut render_elements: Vec<OutputRenderElement> = Vec::new();
+
+    // Render cursor at center of screen for initial frame
+    let output_size = output
+        .current_mode()
+        .map(|m| m.size)
+        .unwrap_or((1920, 1080).into());
+    let cursor_pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+        output_size.w as f64 / 2.0,
+        output_size.h as f64 / 2.0,
+    ));
+
+    if let Some(cursor_element) =
+        state
+            .cursor_manager
+            .render_cursor(&mut device.gles, cursor_pos, output_scale)
+    {
+        render_elements.push(OutputRenderElement::Cursor(cursor_element));
     }
 
-    let Some(device) = udev_data.devices.get_mut(&node) else {
-        error!("Missing device in VBlank callback for CRTC {:?}", crtc);
-        return;
-    };
+    // Render frame using DRM compositor
+    let render_result = surface.compositor.render_frame(
+        &mut device.gles,
+        &render_elements,
+        [0.1, 0.1, 0.1, 1.0], // Background color (dark gray)
+        FrameFlags::empty(),
+    );
 
-    let Some(surface) = device.surfaces.get_mut(&crtc) else {
-        error!("Missing surface in VBlank callback for CRTC {:?}", crtc);
-        return;
-    };
-
-    // Mark the last frame as submitted
-    match surface.compositor.frame_submitted() {
-        Ok(_) => {}
+    match render_result {
+        Ok(_render_output) => {
+            // Always queue for initial frame
+            match surface.compositor.queue_frame(()) {
+                Ok(_) => {
+                    info!(
+                        "Initial frame queued successfully for output {}",
+                        output.name()
+                    );
+                    surface.needs_initial_frame = false;
+                    surface.redraw_state = RedrawState::WaitingForVBlank;
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to queue initial frame for {}: {}", output.name(), e);
+                    Err(format!("Failed to queue initial frame: {}", e).into())
+                }
+            }
+        }
         Err(e) => {
-            warn!("Error in frame_submitted: {}", e);
+            error!(
+                "Failed to render initial frame for {}: {}",
+                output.name(),
+                e
+            );
+            Err(format!("Failed to render initial frame: {}", e).into())
         }
     }
-
-    // Render the next frame
-    render_surface(state, node, crtc);
 }
 
 /// Queue a redraw for a specific surface
+/// This marks the surface as needing a redraw - the actual render happens on VBlank
 fn queue_redraw(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
-    // For DRM backend, we render on VBlank, but we can trigger an immediate render
-    // by rendering now (which will queue and wait for VBlank)
-    render_surface(state, node, crtc);
-}
-
-/// Render a frame on a specific surface
-fn render_surface(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
-    let start_time = state.start_time;
-
     let Some(udev_data) = state.udev_data.as_mut() else {
         return;
     };
-
-    if !udev_data.session_active {
-        return;
-    }
 
     let Some(device) = udev_data.devices.get_mut(&node) else {
         return;
     };
 
     let Some(surface) = device.surfaces.get_mut(&crtc) else {
+        return;
+    };
+
+    // Only queue if we're idle - don't interrupt a pending frame
+    match surface.redraw_state {
+        RedrawState::Idle => {
+            surface.redraw_state = RedrawState::Queued;
+            // Immediately render since we're idle
+            render_surface(state, node, crtc);
+        }
+        RedrawState::Queued => {
+            // Already queued, nothing to do
+        }
+        RedrawState::WaitingForVBlank => {
+            // Already waiting for VBlank, will render after it
+            surface.redraw_state = RedrawState::Queued;
+        }
+    }
+}
+
+/// Render a frame on a specific surface
+/// This should only be called when redraw_state is Queued or for initial frame
+fn render_surface(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
+    let start_time = state.start_time;
+
+    // Get cursor position and output geometry before borrowing udev_data
+    let cursor_pos = state.seat.get_pointer().map(|p| p.current_location());
+
+    let Some(udev_data) = state.udev_data.as_mut() else {
+        error!("render_surface: udev_data is None");
+        return;
+    };
+
+    if !udev_data.session_active {
+        debug!("render_surface: session not active, skipping");
+        return;
+    }
+
+    let Some(device) = udev_data.devices.get_mut(&node) else {
+        error!("render_surface: device not found for node {:?}", node);
+        return;
+    };
+
+    let Some(surface) = device.surfaces.get_mut(&crtc) else {
+        error!("render_surface: surface not found for crtc {:?}", crtc);
         return;
     };
 
     let output = surface.output.clone();
     let output_scale = Scale::from(output.current_scale().fractional_scale());
 
-    // Collect all render elements in proper stacking order
-    let mut render_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+    // Get output geometry to transform cursor position
+    let output_geo = state.space.output_geometry(&output);
 
-    // 1. Overlay layer (topmost)
+    debug!(
+        "render_surface: rendering frame for output {}",
+        output.name()
+    );
+
+    // Collect all render elements in proper stacking order
+    let mut render_elements: Vec<OutputRenderElement> = Vec::new();
+
+    // 0. Cursor (rendered on top of everything, but only if pointer is on this output)
+    if let (Some(pos), Some(geo)) = (cursor_pos, output_geo) {
+        // Check if cursor is within this output's bounds
+        let output_rect = Rectangle::new(geo.loc, geo.size);
+        if output_rect.contains(pos.to_i32_round()) {
+            // Transform cursor position to be relative to this output
+            let cursor_pos_on_output =
+                Point::from((pos.x - geo.loc.x as f64, pos.y - geo.loc.y as f64));
+            if let Some(cursor_element) = state.cursor_manager.render_cursor(
+                &mut device.gles,
+                cursor_pos_on_output,
+                output_scale,
+            ) {
+                render_elements.push(OutputRenderElement::Cursor(cursor_element));
+            }
+        }
+    }
+
+    // 1. Overlay layer (topmost, after cursor)
     let layer_map = layer_map_for_output(&output);
     for layer_surface in layer_map.layers_on(WlrLayer::Overlay) {
         if let Some(geo) = layer_map.layer_geometry(layer_surface) {
             let loc = geo.loc.to_physical_precise_round(output_scale);
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 layer_surface.render_elements(&mut device.gles, loc, output_scale, 1.0);
-            render_elements.extend(elements);
+            render_elements.extend(elements.into_iter().map(OutputRenderElement::Wayland));
         }
     }
 
@@ -643,7 +963,7 @@ fn render_surface(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
             let loc = geo.loc.to_physical_precise_round(output_scale);
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 layer_surface.render_elements(&mut device.gles, loc, output_scale, 1.0);
-            render_elements.extend(elements);
+            render_elements.extend(elements.into_iter().map(OutputRenderElement::Wayland));
         }
     }
     drop(layer_map);
@@ -653,7 +973,11 @@ fn render_surface(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
         state
             .layout
             .render_elements_for_output(&output, &mut device.gles, output_scale);
-    render_elements.extend(window_elements);
+    render_elements.extend(
+        window_elements
+            .into_iter()
+            .map(OutputRenderElement::Wayland),
+    );
 
     // 4. Bottom layer
     let layer_map = layer_map_for_output(&output);
@@ -662,7 +986,7 @@ fn render_surface(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
             let loc = geo.loc.to_physical_precise_round(output_scale);
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 layer_surface.render_elements(&mut device.gles, loc, output_scale, 1.0);
-            render_elements.extend(elements);
+            render_elements.extend(elements.into_iter().map(OutputRenderElement::Wayland));
         }
     }
 
@@ -672,10 +996,13 @@ fn render_surface(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
             let loc = geo.loc.to_physical_precise_round(output_scale);
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 layer_surface.render_elements(&mut device.gles, loc, output_scale, 1.0);
-            render_elements.extend(elements);
+            render_elements.extend(elements.into_iter().map(OutputRenderElement::Wayland));
         }
     }
     drop(layer_map);
+
+    // Check if this is the first frame that needs to be forced
+    let force_frame = surface.needs_initial_frame;
 
     // Render frame using DRM compositor
     let render_result = surface.compositor.render_frame(
@@ -688,19 +1015,46 @@ fn render_surface(state: &mut TomoeState, node: DrmNode, crtc: crtc::Handle) {
     match render_result {
         Ok(render_output) => {
             // Queue the frame for display
-            if !render_output.is_empty {
-                match surface.compositor.queue_frame(()) {
-                    Ok(_) => {
-                        debug!("Frame queued for output {}", output.name());
-                    }
-                    Err(e) => {
-                        warn!("Error queueing frame: {}", e);
+            // For DRM backend, we ALWAYS queue frames to keep the VBlank loop running
+            // (unlike winit where we can skip frames with no damage)
+            match surface.compositor.queue_frame(()) {
+                Ok(_) => {
+                    debug!(
+                        "Frame queued for output {} (force={}, is_empty={})",
+                        output.name(),
+                        force_frame,
+                        render_output.is_empty
+                    );
+                    // Mark initial frame as done and update state
+                    surface.needs_initial_frame = false;
+                    surface.redraw_state = RedrawState::WaitingForVBlank;
+                }
+                Err(e) => {
+                    // SwapBuffersError::AlreadySwapped is common and not a real error
+                    // It just means a frame is already pending
+                    if !e.to_string().contains("AlreadySwapped") {
+                        error!("Error queueing frame for {}: {}", output.name(), e);
+                        // If this was the initial frame, we need to exit gracefully
+                        if force_frame {
+                            error!("FATAL: Failed to queue initial frame - exiting to avoid black screen");
+                            state.running = false;
+                        }
+                    } else {
+                        // Frame already swapped - we're already waiting for VBlank
+                        surface.redraw_state = RedrawState::WaitingForVBlank;
                     }
                 }
             }
         }
         Err(e) => {
-            warn!("Error rendering frame: {}", e);
+            error!("Error rendering frame for {}: {}", output.name(), e);
+            // If this was the initial frame, we need to exit gracefully
+            if force_frame {
+                error!("FATAL: Failed to render initial frame - exiting to avoid black screen");
+                state.running = false;
+            }
+            // Go back to idle on error so we can retry
+            surface.redraw_state = RedrawState::Idle;
         }
     }
 
