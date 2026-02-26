@@ -48,7 +48,7 @@ pub fn init_winit(
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
-            make: "Smithay".into(),
+            make: "tomoe".into(),
             model: "Winit".into(),
         },
     );

@@ -11,6 +11,9 @@ pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
 
+    #[serde(default)]
+    pub keyboard: KeyboardConfig,
+
     /// Tiling configuration
     #[serde(default)]
     pub tiling: TilingConfig,
@@ -33,6 +36,59 @@ pub struct GeneralConfig {
     /// Outer margin around the workspace
     #[serde(default = "default_margin")]
     pub margin: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyboardConfig {
+    /// XKB rules (empty = system default)
+    #[serde(default)]
+    pub rules: Option<String>,
+
+    /// XKB model (empty = system default)
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Keyboard layout(s), comma-separated (e.g., "us,de")
+    #[serde(default)]
+    pub layout: Option<String>,
+
+    /// Layout variant(s), comma-separated
+    #[serde(default)]
+    pub variant: Option<String>,
+
+    /// XKB options (e.g., "grp:alt_shift_toggle,ctrl:nocaps")
+    #[serde(default)]
+    pub options: Option<String>,
+
+    /// Key repeat delay in milliseconds
+    #[serde(default = "default_repeat_delay")]
+    pub repeat_delay: i32,
+
+    /// Key repeat rate in milliseconds
+    #[serde(default = "default_repeat_rate")]
+    pub repeat_rate: i32,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            rules: None,
+            model: None,
+            layout: None,
+            variant: None,
+            options: None,
+            repeat_delay: default_repeat_delay(),
+            repeat_rate: default_repeat_rate(),
+        }
+    }
+}
+
+fn default_repeat_delay() -> i32 {
+    200
+}
+
+fn default_repeat_rate() -> i32 {
+    25
 }
 
 impl Default for GeneralConfig {
@@ -135,6 +191,7 @@ impl Default for Config {
 
         Self {
             general: GeneralConfig::default(),
+            keyboard: KeyboardConfig::default(),
             tiling: TilingConfig::default(),
             keybinds,
             on_start: vec![
@@ -231,6 +288,37 @@ impl Config {
         output.push_str(&format!("gap = {}\n", self.general.gap));
         output.push_str(&format!("# Outer margin around the workspace\n"));
         output.push_str(&format!("margin = {}\n\n", self.general.margin));
+
+        output.push_str("# Keyboard/input configuration\n");
+        output.push_str("# All fields are optional - empty values use system defaults\n");
+        output.push_str("[keyboard]\n");
+        output.push_str("# XKB layout(s), comma-separated for multiple (e.g., \"us,de,fr\")\n");
+        if let Some(ref layout) = self.keyboard.layout {
+            output.push_str(&format!("layout = \"{}\"\n", layout));
+        } else {
+            output.push_str("# layout = \"us\"\n");
+        }
+        output.push_str("# XKB variant(s), comma-separated to match layouts\n");
+        if let Some(ref variant) = self.keyboard.variant {
+            output.push_str(&format!("variant = \"{}\"\n", variant));
+        } else {
+            output.push_str("# variant = \"dvorak\"\n");
+        }
+        output.push_str("# XKB options for layout switching, etc.\n");
+        output.push_str("# Common options:\n");
+        output.push_str("#   grp:alt_shift_toggle  - Alt+Shift to switch layouts\n");
+        output.push_str("#   grp:ctrl_shift_toggle - Ctrl+Shift to switch layouts\n");
+        output.push_str("#   grp:win_space_toggle  - Super+Space to switch layouts\n");
+        output.push_str("#   ctrl:nocaps           - Caps Lock as Ctrl\n");
+        if let Some(ref options) = self.keyboard.options {
+            output.push_str(&format!("options = \"{}\"\n", options));
+        } else {
+            output.push_str("# options = \"grp:alt_shift_toggle\"\n");
+        }
+        output.push_str(&format!("# Key repeat delay in milliseconds\n"));
+        output.push_str(&format!("repeat_delay = {}\n", self.keyboard.repeat_delay));
+        output.push_str(&format!("# Key repeat rate in milliseconds\n"));
+        output.push_str(&format!("repeat_rate = {}\n\n", self.keyboard.repeat_rate));
 
         output.push_str("# Tiling configuration\n");
         output.push_str("[tiling]\n");

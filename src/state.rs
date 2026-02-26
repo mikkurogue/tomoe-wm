@@ -1,7 +1,7 @@
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     desktop::{PopupManager, Space, Window},
-    input::{Seat, SeatState},
+    input::{keyboard::XkbConfig, Seat, SeatState},
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
         wayland_server::{
@@ -77,8 +77,29 @@ impl TomoeState {
         // Initialize seat (input devices)
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
-        seat.add_keyboard(Default::default(), 200, 25)
-            .expect("Failed to add keyboard");
+
+        // Build XkbConfig from config, using empty strings for system defaults
+        let xkb_config = XkbConfig {
+            rules: config.keyboard.rules.as_deref().unwrap_or(""),
+            model: config.keyboard.model.as_deref().unwrap_or(""),
+            layout: config.keyboard.layout.as_deref().unwrap_or(""),
+            variant: config.keyboard.variant.as_deref().unwrap_or(""),
+            options: config.keyboard.options.clone(),
+        };
+
+        tracing::info!(
+            "Keyboard config: layout={:?}, variant={:?}, options={:?}",
+            config.keyboard.layout,
+            config.keyboard.variant,
+            config.keyboard.options
+        );
+
+        seat.add_keyboard(
+            xkb_config,
+            config.keyboard.repeat_delay,
+            config.keyboard.repeat_rate,
+        )
+        .expect("Failed to add keyboard");
         seat.add_pointer();
 
         // Setup wayland socket
