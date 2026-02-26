@@ -11,13 +11,31 @@ toml = "1.0"
 dirs = "6.0"
 xdg = "3.0"
 
+# For libinput
+input = "0.9"
+
+# For DRM extras (connector scanning, EDID)
+smithay-drm-extras = { version = "0.1", default-features = false }
+
 [dependencies.smithay]
 version = "0.7"
 default-features = false
 features = [
+    # Winit backend (for nested/development)
     "backend_winit",
+    
+    # DRM backend (for native/production)
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    
+    # Rendering
     "backend_egl",
+    "renderer_gl",
+    
+    # Wayland
     "wayland_frontend",
     "desktop",
-    "renderer_gl",
 ]

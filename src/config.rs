@@ -18,6 +18,10 @@ pub struct Config {
     #[serde(default)]
     pub tiling: TilingConfig,
 
+    /// Output/monitor configuration
+    #[serde(default)]
+    pub outputs: Vec<OutputConfig>,
+
     /// Keybindings
     #[serde(default)]
     pub keybinds: HashMap<String, KeyAction>,
@@ -136,6 +140,51 @@ fn default_true() -> bool {
     true
 }
 
+/// Output/monitor configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// Output name (e.g., "HDMI-A-1", "eDP-1", "DP-1")
+    pub name: String,
+
+    /// X position in pixels (optional, auto-arranged if not specified)
+    #[serde(default)]
+    pub x: Option<i32>,
+
+    /// Y position in pixels (optional, auto-arranged if not specified)
+    #[serde(default)]
+    pub y: Option<i32>,
+
+    /// Output scale factor (e.g., 1.0, 1.5, 2.0)
+    #[serde(default)]
+    pub scale: Option<f64>,
+
+    /// Transform/rotation: "normal", "90", "180", "270", "flipped", "flipped-90", etc.
+    #[serde(default)]
+    pub transform: Option<String>,
+
+    /// Preferred mode (e.g., "1920x1080@60" or "preferred")
+    #[serde(default)]
+    pub mode: Option<String>,
+
+    /// Whether this output is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            x: None,
+            y: None,
+            scale: None,
+            transform: None,
+            mode: None,
+            enabled: true,
+        }
+    }
+}
+
 /// Action to perform when a keybind is triggered
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -156,6 +205,18 @@ pub enum KeyAction {
     Fullscreen,
     /// Quit the compositor
     Quit,
+
+    // Workspace actions
+    /// Switch to a specific workspace (1-indexed for user convenience)
+    SwitchToWorkspace { workspace: usize },
+    /// Switch to the next workspace
+    NextWorkspace,
+    /// Switch to the previous workspace
+    PrevWorkspace,
+    /// Move focused window to a specific workspace (1-indexed)
+    MoveToWorkspace { workspace: usize },
+    /// Create a new workspace
+    NewWorkspace,
 }
 
 impl Default for Config {
@@ -189,10 +250,34 @@ impl Default for Config {
         keybinds.insert("Super+Ctrl+f".to_string(), KeyAction::Fullscreen);
         keybinds.insert("Super+Ctrl+Shift+e".to_string(), KeyAction::Quit);
 
+        // Workspace navigation (Super+Ctrl+1-9 to switch)
+        for i in 1..=9 {
+            keybinds.insert(
+                format!("Super+Ctrl+{}", i),
+                KeyAction::SwitchToWorkspace { workspace: i },
+            );
+        }
+
+        // Move window to workspace (Super+Ctrl+Shift+1-9)
+        for i in 1..=9 {
+            keybinds.insert(
+                format!("Super+Ctrl+Shift+{}", i),
+                KeyAction::MoveToWorkspace { workspace: i },
+            );
+        }
+
+        // Next/prev workspace with Page_Up/Page_Down
+        keybinds.insert("Super+Ctrl+Page_Up".to_string(), KeyAction::PrevWorkspace);
+        keybinds.insert("Super+Ctrl+Page_Down".to_string(), KeyAction::NextWorkspace);
+
+        // Create new workspace
+        keybinds.insert("Super+Ctrl+n".to_string(), KeyAction::NewWorkspace);
+
         Self {
             general: GeneralConfig::default(),
             keyboard: KeyboardConfig::default(),
             tiling: TilingConfig::default(),
+            outputs: Vec::new(), // Empty = auto-detect and auto-arrange
             keybinds,
             on_start: vec![
                 // Example startup commands (commented out in default)
@@ -330,6 +415,45 @@ impl Config {
         output.push_str("# Enable scrolling tiling (niri-style horizontal scrolling)\n");
         output.push_str(&format!("scrolling = {}\n\n", self.tiling.scrolling));
 
+        output.push_str("# Output/monitor configuration (optional)\n");
+        output.push_str(
+            "# If not specified, outputs are auto-detected and auto-arranged left-to-right\n",
+        );
+        output.push_str("# Example:\n");
+        output.push_str("# [[outputs]]\n");
+        output.push_str("# name = \"HDMI-A-1\"\n");
+        output.push_str("# x = 0\n");
+        output.push_str("# y = 0\n");
+        output.push_str("# scale = 1.0\n");
+        output.push_str("# mode = \"1920x1080@60\"\n");
+        output.push_str("#\n");
+        output.push_str("# [[outputs]]\n");
+        output.push_str("# name = \"eDP-1\"\n");
+        output.push_str("# x = 1920\n");
+        output.push_str("# y = 0\n");
+        output.push_str("# scale = 1.5\n\n");
+
+        for out_cfg in &self.outputs {
+            output.push_str("[[outputs]]\n");
+            output.push_str(&format!("name = \"{}\"\n", out_cfg.name));
+            if let Some(x) = out_cfg.x {
+                output.push_str(&format!("x = {}\n", x));
+            }
+            if let Some(y) = out_cfg.y {
+                output.push_str(&format!("y = {}\n", y));
+            }
+            if let Some(scale) = out_cfg.scale {
+                output.push_str(&format!("scale = {}\n", scale));
+            }
+            if let Some(ref transform) = out_cfg.transform {
+                output.push_str(&format!("transform = \"{}\"\n", transform));
+            }
+            if let Some(ref mode) = out_cfg.mode {
+                output.push_str(&format!("mode = \"{}\"\n", mode));
+            }
+            output.push_str(&format!("enabled = {}\n\n", out_cfg.enabled));
+        }
+
         output.push_str("# Keybindings\n");
         output.push_str("# Format: \"Modifier+Key\" = { action = \"action_name\", ... }\n");
         output.push_str("# Available modifiers: Super, Ctrl, Alt, Shift\n");
@@ -342,6 +466,15 @@ impl Config {
         output.push_str("#   - scroll_right: { action = \"scroll_right\" }\n");
         output.push_str("#   - fullscreen: { action = \"fullscreen\" }\n");
         output.push_str("#   - quit: { action = \"quit\" }\n");
+        output.push_str(
+            "#   - switch_to_workspace: { action = \"switch_to_workspace\", workspace = 1 }\n",
+        );
+        output.push_str("#   - next_workspace: { action = \"next_workspace\" }\n");
+        output.push_str("#   - prev_workspace: { action = \"prev_workspace\" }\n");
+        output.push_str(
+            "#   - move_to_workspace: { action = \"move_to_workspace\", workspace = 1 }\n",
+        );
+        output.push_str("#   - new_workspace: { action = \"new_workspace\" }\n");
         output.push_str("#\n");
         output.push_str(
             "# Note: Using Super+Ctrl as base modifier for nested compositor compatibility\n",
@@ -360,6 +493,21 @@ impl Config {
                 KeyAction::ScrollRight => "{ action = \"scroll_right\" }".to_string(),
                 KeyAction::Fullscreen => "{ action = \"fullscreen\" }".to_string(),
                 KeyAction::Quit => "{ action = \"quit\" }".to_string(),
+                KeyAction::SwitchToWorkspace { workspace } => {
+                    format!(
+                        "{{ action = \"switch_to_workspace\", workspace = {} }}",
+                        workspace
+                    )
+                }
+                KeyAction::NextWorkspace => "{ action = \"next_workspace\" }".to_string(),
+                KeyAction::PrevWorkspace => "{ action = \"prev_workspace\" }".to_string(),
+                KeyAction::MoveToWorkspace { workspace } => {
+                    format!(
+                        "{{ action = \"move_to_workspace\", workspace = {} }}",
+                        workspace
+                    )
+                }
+                KeyAction::NewWorkspace => "{ action = \"new_workspace\" }".to_string(),
             };
             output.push_str(&format!("\"{}\" = {}\n", key, action_str));
         }

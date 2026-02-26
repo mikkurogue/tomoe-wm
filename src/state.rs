@@ -26,8 +26,10 @@ use smithay::{
 };
 use std::{ffi::OsString, sync::Arc, time::Instant};
 
+use crate::backend::udev::UdevData;
 use crate::config::Config;
 use crate::wm::tiling::TilingLayout;
+use crate::wm::Layout;
 
 pub struct TomoeState {
     pub display_handle: DisplayHandle,
@@ -43,6 +45,7 @@ pub struct TomoeState {
     pub space: Space<Window>,
     pub popups: PopupManager,
     pub tiling: TilingLayout,
+    pub layout: Layout,
 
     // Protocol state
     pub compositor_state: CompositorState,
@@ -60,6 +63,9 @@ pub struct TomoeState {
 
     // For dmabuf import validation
     pub dmabuf_imported: Option<Dmabuf>,
+
+    // Backend-specific data
+    pub udev_data: Option<UdevData>,
 }
 
 impl TomoeState {
@@ -114,6 +120,13 @@ impl TomoeState {
             config.tiling.default_window_width,
         );
 
+        // Initialize layout manager (will be populated when outputs are added)
+        let layout = Layout::new(
+            config.general.gap,
+            config.general.margin,
+            config.tiling.default_window_width,
+        );
+
         Self {
             display_handle: dh,
             socket_name,
@@ -124,6 +137,7 @@ impl TomoeState {
             space: Space::default(),
             popups: PopupManager::default(),
             tiling,
+            layout,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -136,6 +150,7 @@ impl TomoeState {
             layer_shell_state,
             seat,
             dmabuf_imported: None,
+            udev_data: None,
         }
     }
 

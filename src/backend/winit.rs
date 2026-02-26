@@ -68,7 +68,10 @@ pub fn init_winit(
     output.create_global::<TomoeState>(&state.display_handle);
     state.space.map_output(&output, (0, 0));
 
-    // Set initial tiling layout size
+    // Add output to the layout system (creates a monitor with one workspace)
+    state.layout.add_output(output.clone());
+
+    // Set initial tiling layout size (legacy, keep for compatibility)
     state
         .tiling
         .set_output_size(Size::from((initial_size.w as i32, initial_size.h as i32)));

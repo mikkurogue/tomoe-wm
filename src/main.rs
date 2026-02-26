@@ -8,6 +8,7 @@ mod wm;
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
 use tracing::info;
 
+use crate::backend::BackendType;
 use crate::config::Config;
 use crate::state::TomoeState;
 
@@ -26,6 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load();
     info!("Config loaded from {:?}", Config::config_path());
 
+    // Auto-detect backend
+    let backend_type = BackendType::auto_detect();
+
     // Create event loop
     let mut event_loop: EventLoop<TomoeState> = EventLoop::try_new()?;
 
@@ -35,8 +39,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize compositor state
     let mut state = TomoeState::new(&mut event_loop, display, config);
 
-    // Initialize winit backend
-    backend::init_winit(&mut event_loop, &mut state)?;
+    // Initialize the appropriate backend
+    match backend_type {
+        BackendType::Winit => {
+            info!("Initializing Winit backend (nested mode)");
+            backend::init_winit(&mut event_loop, &mut state)?;
+        }
+        BackendType::Udev => {
+            info!("Initializing Udev backend (native DRM mode)");
+            backend::init_udev(&mut event_loop, &mut state)?;
+        }
+    }
 
     // Set WAYLAND_DISPLAY for child processes
     std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);

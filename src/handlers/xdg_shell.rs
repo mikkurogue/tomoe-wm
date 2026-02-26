@@ -36,7 +36,11 @@ impl XdgShellHandler for TomoeState {
         // Create window
         let window = Window::new_wayland_window(surface);
 
-        // Add to tiling layout (this will configure the window size)
+        // Add to both layout systems for now (layout is primary, tiling is legacy)
+        // The layout system manages windows per-workspace
+        self.layout.add_window(window.clone());
+
+        // Also add to legacy tiling for compatibility during transition
         self.tiling.add_window(window.clone());
 
         // Map the window in the space at its tiling position
@@ -171,7 +175,8 @@ impl XdgShellHandler for TomoeState {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         info!("Toplevel surface destroyed");
         if let Some(window) = self.find_window(&surface) {
-            // Remove from tiling layout
+            // Remove from both layout systems
+            self.layout.remove_window(&window);
             self.tiling.remove_window(&window);
             self.space.unmap_elem(&window);
 
@@ -181,10 +186,10 @@ impl XdgShellHandler for TomoeState {
                 self.space.map_element(w.clone(), pos, false);
             }
 
-            // Update focus to the new focused window in tiling
+            // Update focus to the new focused window in layout
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             let keyboard = self.seat.get_keyboard().unwrap();
-            if let Some(focused) = self.tiling.focused_window() {
+            if let Some(focused) = self.layout.focused_window() {
                 if let Some(toplevel) = focused.toplevel() {
                     keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
                 }
